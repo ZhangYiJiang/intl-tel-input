@@ -40,6 +40,7 @@ export default class UI {
   #searchTokens!: SearchTokensMap;
   #searchDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   #inlineDropdownHeight?: number;
+  #cssAnchorPositioningDone = false;
   #countryContainerEl?: HTMLElement;
   #selectedCountryEl?: HTMLElement;
   #selectedFlagEl?: HTMLElement;
@@ -286,19 +287,7 @@ export default class UI {
       this.#updateSearchResultsA11yText();
     }
 
-    if (!isFullscreen) {
-      // capture the dropdown size for later uses: (1) on dropdown open: decide whether to position it above or below the input, and (2) when countrySearch enabled, fix the dropdown height (and, when matchDropdownWidth is disabled, width) to prevent it jumping around when filtering the country list.
-      const { height, width } = this.#getHiddenInlineDropdownSize();
-      this.#inlineDropdownHeight = height;
-      // fix the dropdown height when using countrySearch so when dropdown is positioned above input, and you type in the search input and the country list changes, the search input doesn't jump up/down. (NOTE: the country list just has a max-height as it may only be needed to show a few items e.g. from onlyCountries, or from filtering with a search query)
-      if (countrySearch) {
-        this.#countrySelectorEl.style.height = `${height}px`;
-        // With matchDropdownWidth disabled, the dropdown width tracks its widest country name (white-space: nowrap). Filtering the list would shrink it as the user types, so pin the width to its initial natural width.
-        if (!matchDropdownWidth && width > 0) {
-          this.#countrySelectorEl.style.width = `${width}px`;
-        }
-      }
-    }
+    //* NOTE: measuring the inline dropdown size (which forces a synchronous layout reflow) is deferred to the first open — see #ensureInlineDropdownSizeMeasured — so that init does no layout work for a dropdown that may never be opened.
 
     //* Detached country selector: required for fullscreen (always attached to document.body), or optional for dropdown (when dropdownParent is set to escape an overflow:hidden ancestor).
     if (detachedParent) {
@@ -311,9 +300,7 @@ export default class UI {
       });
       this.#detachedCountrySelectorEl = createEl("div", { class: wrapperClasses });
       this.#detachedCountrySelectorEl.appendChild(this.#countrySelectorEl);
-      if (!isFullscreen) {
-        this.#setupCssAnchorPositioning();
-      }
+      //* NOTE: CSS anchor positioning (which forces a getComputedStyle style recalc) is set up lazily on first open — see #setupCssAnchorPositioning — to keep init free of layout/style work.
     } else {
       this.#countryContainerEl!.appendChild(this.#countrySelectorEl!);
     }
@@ -528,29 +515,17 @@ export default class UI {
     this.#resizeObserver.observe(this.#selectedCountryEl);
   }
 
-  static #getBody(): HTMLElement {
-    // Use window.top as a fix for same-origin iframes (that are hidden during init) where even appending it to document.body would still be hidden. window.top accesses the top-most document, which will not be hidden.
-    let body;
-    try {
-      body = window.top!.document.body;
-      // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    } catch (e) {
-      // fix for cross-origin iframes, where accessing window.top.document throws a security error
-      body = document.body;
-    }
-    return body;
-  }
-
   //* When input is in a hidden container during init, we cannot calculate the selected country width.
   //* Fix: clone the markup, make it invisible, add it to the end of the DOM, and then measure it's width.
   //* To get the right styling to apply, all we need is a shallow clone of the container,
   //* and then to inject a deep clone of the selectedCountryEl element.
+  //* Measures in the LOCAL document.body: appending to the local body escapes any hidden ancestor container, and the input's own frame is where intl-tel-input's styles live (so the clone lays out correctly). We deliberately do NOT escape to window.top: that only measures correctly in the rare case where the top frame also loads the library's styles, and measures wrong when it doesn't (e.g. a same-origin iframe whose outer frame lacks the styles — cf. #2178). If the local frame itself isn't laid out yet (e.g. an iframe hidden during init), this returns 0 and the caller falls back to a sane constant; the ResizeObserver in #observeSelectedCountryResize then corrects the padding once the input becomes visible.
   #getHiddenSelectedCountryWidth(): number {
     if (!this.telInputEl.parentNode) {
       return 0;
     }
 
-    const body = UI.#getBody();
+    const body = document.body;
     const containerClone = this.telInputEl.parentNode!.cloneNode(
       false,
     ) as HTMLElement;
@@ -571,26 +546,55 @@ export default class UI {
     return width;
   }
 
-  // Get the dropdown size (before it is added to the DOM)
+  //* Measure the inline dropdown size once, lazily, on first open — see #getHiddenInlineDropdownSize for why measuring forces a reflow. Memoised via #inlineDropdownHeight so subsequent opens are free.
+  //* Captured for two uses: (1) on open, decide whether to position the dropdown above or below the input; (2) when countrySearch is enabled, pin the dropdown height (and, when matchDropdownWidth is disabled, width) so it doesn't jump around as the country list is filtered.
+  #ensureInlineDropdownSizeMeasured(): void {
+    if (this.#inlineDropdownHeight !== undefined) {
+      return;
+    }
+    const { countrySearch, matchDropdownWidth } = this.#options;
+    const { height, width } = this.#getHiddenInlineDropdownSize();
+    this.#inlineDropdownHeight = height;
+    // fix the dropdown height when using countrySearch so when dropdown is positioned above input, and you type in the search input and the country list changes, the search input doesn't jump up/down. (NOTE: the country list just has a max-height as it may only be needed to show a few items e.g. from onlyCountries, or from filtering with a search query)
+    if (countrySearch) {
+      this.#countrySelectorEl!.style.height = `${height}px`;
+      // With matchDropdownWidth disabled, the dropdown width tracks its widest country name (white-space: nowrap). Filtering the list would shrink it as the user types, so pin the width to its initial natural width.
+      if (!matchDropdownWidth && width > 0) {
+        this.#countrySelectorEl!.style.width = `${width}px`;
+      }
+    }
+  }
+
+  // Measure the dropdown by moving it into a temporary hidden container on the body (it needs the right ancestor classes to lay out correctly). Restores it to its original position afterwards — a no-op during init (when it is still detached) but required when called lazily on first open (when it is already inserted).
+  //* Deliberately measures in the LOCAL document.body (not window.top): this runs on first open, when the input's own frame is visibly rendered and styled. Escaping to the top frame breaks when the input is inside a same-origin iframe whose outer frame lacks intl-tel-input's styles (e.g. Storybook), as the dropdown would then be measured unstyled and come out far too tall (issue #2178).
   #getHiddenInlineDropdownSize(): { height: number; width: number } {
-    const body = UI.#getBody();
-    // it's safe to remove the hide class as the dropdown has not yet been added to the DOM
-    this.#countrySelectorEl!.classList.remove(CLASSES.HIDE);
+    const body = document.body;
+    const selectorEl = this.#countrySelectorEl!;
+    const originalParent = selectorEl.parentNode;
+    const originalNextSibling = selectorEl.nextSibling;
+
+    // safe to remove the hide class as we measure inside a detached, hidden temp container
+    selectorEl.classList.remove(CLASSES.HIDE);
 
     // it needs these classes on the container to get the correct height
     const tempContainer = createEl("div", {
       class: "iti iti--inline-country-selector",
     });
-    tempContainer.appendChild(this.#countrySelectorEl!);
+    tempContainer.appendChild(selectorEl);
 
     tempContainer.style.visibility = "hidden";
     body.appendChild(tempContainer);
-    const height = this.#countrySelectorEl!.offsetHeight;
-    const width = this.#countrySelectorEl!.offsetWidth;
+    const height = selectorEl.offsetHeight;
+    const width = selectorEl.offsetWidth;
     body.removeChild(tempContainer);
-    tempContainer.style.visibility = "";
 
-    this.#countrySelectorEl!.classList.add(CLASSES.HIDE);
+    selectorEl.classList.add(CLASSES.HIDE);
+
+    // restore the dropdown to where it was (no-op at init when originalParent is null)
+    if (originalParent) {
+      originalParent.insertBefore(selectorEl, originalNextSibling);
+    }
+
     return {
       height: height > 0 ? height : LAYOUT.FALLBACK_DROPDOWN_HEIGHT,
       width,
@@ -807,6 +811,11 @@ export default class UI {
     const { countrySearch, dropdownAlwaysOpen } = this.#options;
 
     this.#countrySelectorAbortController = new AbortController();
+
+    // Lazily measure the inline dropdown size on first open (memoised). Fullscreen doesn't use these measurements. Done before ensureDropdownWidthSet so the natural width/height is measured before matchDropdownWidth pins the width (matching the original init ordering).
+    if (this.#options.countrySelectorMode !== COUNTRY_SELECTOR_MODE.FULLSCREEN) {
+      this.#ensureInlineDropdownSizeMeasured();
+    }
 
     // if matchDropdownWidth enabled, and the width was not set during init (e.g. because input was hidden), then set it now as the input must be visible now.
     this.ensureDropdownWidthSet();
@@ -1184,7 +1193,12 @@ export default class UI {
         this.#detachedCountrySelectorEl!.style.paddingLeft = `${inputPos.left}px`;
         this.#detachedCountrySelectorEl!.style.paddingRight = `${window.innerWidth - inputPos.right}px`;
       }
-    } else if (!supportsCssAnchor) {
+    } else {
+      // Set up CSS anchor positioning on first open (memoised) before the dropdown is revealed. Inert in browsers without anchor() support, which use the fixed-coordinate fallback below instead.
+      this.#setupCssAnchorPositioning();
+    }
+
+    if (!isFullscreen && !supportsCssAnchor) {
       //* For browsers that support it, we fix the detached dropdown to the input using CSS Anchor Positioning.
       //* For older browsers, we position the dropdown next to the input using fixed coordinates.
       const inputPos = this.telInputEl.getBoundingClientRect();
@@ -1202,13 +1216,17 @@ export default class UI {
   }
 
   //* Wire up CSS Anchor Positioning between the input and the detached country selector using a
-  //* unique anchor name per instance. Called once at build time — the matching styles in
+  //* unique anchor name per instance. Called lazily on first open (memoised) — the matching styles in
   //* intlTelInput.css only take effect in browsers that support anchor(); elsewhere these
   //* properties are inert. We append our name to any existing anchor-name (read via
   //* getComputedStyle so we pick up CSS-defined values), so consumer-set anchors on the input
   //* are preserved. Caveat: this snapshots the consumer's value once — if they later change
   //* anchor-name via CSS (e.g. a class swap), our inline write will shadow the change.
   #setupCssAnchorPositioning(): void {
+    if (this.#cssAnchorPositioningDone) {
+      return;
+    }
+    this.#cssAnchorPositioningDone = true;
     const anchorName = `--iti-anchor-${this.#id}`;
     const existing = getComputedStyle(this.telInputEl).anchorName;
     this.telInputEl.style.anchorName =
